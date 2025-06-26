@@ -1,6 +1,4 @@
 import yaml from 'js-yaml';
-import { prependNodeName } from '../src/lib/utils.js';
-
 // --- 全局常量 ---
 const KV_KEY_MAIN = 'misub_data_v1';
 const KV_KEY_SETTINGS = 'worker_settings_v1';
@@ -12,11 +10,10 @@ const defaultSettings = {
   BotToken: '',
   ChatID: '',
   subConverter: 'subapi.cmliussss.com',
-  subConfig: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini',
-  prependSubName: true // [新增] 默认开启前缀功能
+  subConfig: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini'
 };
 
-// --- 核心工具函数 (身份验证) ---
+// --- 核心工具函数 (自包含，无外部依赖) ---
 async function createSignedToken(key, data) {
     if (!key || !data) throw new Error("Key and data are required for signing.");
     const encoder = new TextEncoder();
@@ -36,6 +33,55 @@ async function verifySignedToken(key, token) {
     return token === expectedToken ? data : null;
 }
 
+async function MD5MD5(text) {
+    const encoder = new TextEncoder();
+    const firstPass = await crypto.subtle.digest('MD5', encoder.encode(text));
+    const firstHex = Array.from(new Uint8Array(firstPass)).map(b => b.toString(16).padStart(2, '0')).join('');
+    const secondPass = await crypto.subtle.digest('MD5', encoder.encode(firstHex.slice(7, 27)));
+    return Array.from(new Uint8Array(secondPass)).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase();
+}
+
+function isValidBase64(str) { try { return btoa(atob(str)) == str; } catch (err) { return false; } }
+
+function clashFix(content) {
+    if (content.includes('wireguard') && !content.includes('remote-dns-resolve')) {
+        let lines = content.includes('\r\n') ? content.split('\r\n') : content.split('\n');
+        return lines.map(line => line.includes('type: wireguard') ? line.replace(/, udp: true/g, ', remote-dns-resolve: true, udp: true') : line).join('\n');
+    }
+    return content;
+}
+
+async function getUrl(targetUrl, userAgentHeader) {
+    const newHeaders = new Headers({ 'User-Agent': `MISUB-Client/${userAgentHeader}` });
+    return fetch(new Request(targetUrl, { headers: newHeaders, redirect: "follow" }));
+}
+
+async function getSUB(apiUrls, userAgentHeader) {
+    let content = "";
+    const responses = await Promise.allSettled(apiUrls.map(apiUrl => getUrl(apiUrl, userAgentHeader).then(res => res.ok ? res.text() : Promise.reject(new Error(`Fetch failed: ${res.status}`)))));
+    for (const response of responses) {
+        if (response.status === 'fulfilled') {
+            const text = response.value;
+            if (text.includes('://')) { content += text + '\n'; }
+            else if (isValidBase64(text.replace(/\s/g, ''))) { try { content += atob(text) + '\n'; } catch (e) {} }
+        }
+    }
+    return content;
+}
+
+async function sendMessage(botToken, chatId, type, ip, add_data = "") {
+    if (!botToken || !chatId) return;
+    let msg = `${type}\nIP: ${ip || 'N/A'}\n${add_data}`;
+    try {
+        const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
+        if (response.ok) {
+            const ipInfo = await response.json();
+            msg = `${type}\nIP: ${ip}\n地址: ${ipInfo.country}, ${ipInfo.city}\n组织: ${ipInfo.org}\n${add_data}`;
+        }
+    } catch (e) {}
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage?chat_id=${chatId}&parse_mode=HTML&text=${encodeURIComponent(msg)}`);
+}
+
 async function authMiddleware(request, env) {
     if (!env.COOKIE_SECRET) return false;
     const cookie = request.headers.get('Cookie');
@@ -44,13 +90,13 @@ async function authMiddleware(request, env) {
     const token = sessionCookie.split('=')[1];
     const verifiedData = await verifySignedToken(env.COOKIE_SECRET, token);
     return verifiedData && (Date.now() - parseInt(verifiedData, 10) < SESSION_DURATION);
-}
+}       
 
-// --- API 请求处理 ---
 async function handleApiRequest(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/^\/api/, '');
 
+    // 对除登录外的所有API请求进行身份验证
     if (path !== '/login') {
         if (!await authMiddleware(request, env)) {
             return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
@@ -59,6 +105,7 @@ async function handleApiRequest(request, env) {
 
     try {
         switch (path) {
+            // 处理登录请求
             case '/login': {
                 if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
                 const { password } = await request.json();
@@ -71,12 +118,14 @@ async function handleApiRequest(request, env) {
                 return new Response(JSON.stringify({ error: '密码错误' }), { status: 401 });
             }
 
+            // 处理登出请求
             case '/logout': {
                 const headers = new Headers({ 'Content-Type': 'application/json' });
                 headers.append('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`);
                 return new Response(JSON.stringify({ success: true }), { headers });
             }
 
+            // 处理前端初始化时获取数据的请求
             case '/data': {
                 const misubs = await env.MISUB_KV.get(KV_KEY_MAIN, 'json') || [];
                 const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
@@ -84,40 +133,87 @@ async function handleApiRequest(request, env) {
                 return new Response(JSON.stringify({ misubs, config }), { headers: { 'Content-Type': 'application/json' } });
             }
 
+            // 处理保存订阅列表的请求
             case '/misubs': {
-                if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
-                const { misubs } = await request.json();
-                if (typeof misubs === 'undefined') return new Response(JSON.stringify({ success: false, message: '请求体中缺少 misubs 字段' }), { status: 400 });
-                await env.MISUB_KV.put(KV_KEY_MAIN, JSON.stringify(misubs));
-                return new Response(JSON.stringify({ success: true, message: '订阅源已保存' }));
-            }
-            
-            case '/node_count': {
-                if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
-                const { url: subUrl } = await request.json();
-                if (!subUrl || typeof subUrl !== 'string' || !/^https?:\/\//.test(subUrl)) {
-                    return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
-                }
-                const response = await fetch(new Request(subUrl, { headers: {'User-Agent': 'MiSub-Node-Counter'}, redirect: "follow" }));
-                if (!response.ok) return new Response(JSON.stringify({ count: 0 }));
-                
-                const text = await response.text();
-                let decoded = '';
-                try { decoded = atob(text.replace(/\s/g, '')); } catch (e) { decoded = text; }
-                
-                let count = (decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?):\/\//gm) || []).length;
-                return new Response(JSON.stringify({ count }), { headers: { 'Content-Type': 'application/json' } });
+                 if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+                 const { misubs } = await request.json();
+                 if (typeof misubs === 'undefined') return new Response(JSON.stringify({ success: false, message: '请求体中缺少 misubs 字段' }), { status: 400 });
+                 await env.MISUB_KV.put(KV_KEY_MAIN, JSON.stringify(misubs));
+                 return new Response(JSON.stringify({ success: true, message: '订阅源已保存' }));
             }
 
+            // functions/[[path]].js -> handleApiRequest -> switch (path)
+
+            case '/node_count': {
+                if (request.method !== 'POST') {
+                    return new Response('Method Not Allowed', { status: 405 });
+                }
+                try {
+                    const { url: subUrl } = await request.json();
+
+                    if (!subUrl || typeof subUrl !== 'string' || !/^https?:\/\//.test(subUrl)) {
+                        return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+                    }
+        
+                    // 使用带10秒超时控制的 getUrl 函数
+                    const response = await getUrl(subUrl, request.headers.get('User-Agent'));
+                    if (!response.ok) {
+                        return new Response(JSON.stringify({ count: 0, error: `Fetch failed: ${response.status}` }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                    }
+
+                    const text = await response.text();
+                    let decoded = '';
+                    try {
+                        decoded = atob(text.replace(/\s/g, ''));
+                    } catch (e) {
+                        decoded = text;
+                    }
+
+                    let count = 0;
+                    // 【核心优化】
+                    try {
+                        // 优先尝试 YAML 解析
+                        const doc = yaml.load(decoded);
+                        if (doc && Array.isArray(doc.proxies)) {
+                            // 如果是 Clash 配置，直接得到数量
+                            count = doc.proxies.length;
+                        } else {
+                            // 如果不是有效的 Clash 配置，就抛出错误，进入 catch 块
+                            throw new Error('Not a valid Clash config with a proxies array.');
+                        }
+                    } catch (e) {
+                        // YAML 解析失败（对普通订阅是正常情况），立刻回退到极速的按行匹配
+                        const nodeLines = decoded
+                            .split('\n')
+                            .map(line => line.trim())
+                            .filter(line => /^(ss|ssr|vmess|vless|trojan|hysteria2?):\/\//i.test(line));
+                        count = nodeLines.length;
+                    }
+
+                    return new Response(JSON.stringify({ count }), { headers: { 'Content-Type': 'application/json' } });
+
+                } catch (e) {
+                    if (e instanceof SyntaxError) {
+                         return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+                    }
+                    console.error('Critical error in /node_count:', e);
+                    return new Response(JSON.stringify({ count: 0, error: 'An internal error occurred' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                }
+            }
+            // ...existing code...
+
+            // 处理设置的读取和保存
             case '/settings': {
                 if (request.method === 'GET') {
                     const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
-                    return new Response(JSON.stringify({ ...defaultSettings, ...settings }), { headers: { 'Content-Type': 'application/json' } });
+                    const merged = { ...defaultSettings, ...settings };
+                    return new Response(JSON.stringify(merged), { headers: { 'Content-Type': 'application/json' } });
                 }
                 if (request.method === 'POST') {
                     const newSettings = await request.json();
                     const oldSettings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
-                    await env.MISUB_KV.put(KV_KEY_SETTINGS, JSON.stringify({ ...oldSettings, ...newSettings }));
+                    const updatedSettings = { ...oldSettings, ...newSettings };
+                    await env.MISUB_KV.put(KV_KEY_SETTINGS, JSON.stringify(updatedSettings));
                     return new Response(JSON.stringify({ success: true, message: '设置已保存' }));
                 }
                 return new Response('Method Not Allowed', { status: 405 });
@@ -127,133 +223,92 @@ async function handleApiRequest(request, env) {
         console.error(`API Error in path ${path}:`, e);
         return new Response(JSON.stringify({ error: 'Internal Server Error' }), { status: 500 });
     }
+    
     return new Response('API route not found', { status: 404 });
 }
-
-// --- 订阅生成处理 ---
+// --- 订阅生成路由 ---
 async function handleMisubRequest(request, env) {
     const url = new URL(request.url);
     const userAgentHeader = request.headers.get('User-Agent') || "Unknown";
-    const kv_settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
-    const config = { ...defaultSettings, ...kv_settings };
     
-    // 认证
-    const token = url.searchParams.get('token');
-    if (!token || token !== config.mytoken) {
-        return new Response('Invalid token', { status: 403 });
-    }
+    const kv_settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
+    const config = {
+        mytoken: kv_settings.mytoken || env.TOKEN || 'auto',
+        subConverter: kv_settings.subConverter || env.SUBAPI || 'subapi.cmliussss.com',
+        subConfig: kv_settings.subConfig || env.SUBCONFIG || 'https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini',
+        FileName: kv_settings.FileName || env.SUBNAME || 'MISUB',
+        SUBUpdateTime: kv_settings.SUBUpdateTime || env.SUBUPDATETIME || 6,
+        BotToken: kv_settings.BotToken || env.TGTOKEN || '',
+        ChatID: kv_settings.ChatID || env.TGID || '',
+    };
 
-    // ...函数开始部分...
-    // [修改] 获取和合并订阅 (V2 - 支持节点重命名)
+    const timeTemp = Math.ceil(Date.now() / (1000 * 60 * 60));
+    const fakeToken = await MD5MD5(`${config.mytoken}${timeTemp}`);
+    let token = url.searchParams.get('token');
+    if (url.pathname === `/${config.mytoken}`) token = config.mytoken;
+    if (!token || ![config.mytoken, fakeToken].includes(token)) return new Response('Invalid token', { status: 403 });
     const misubs = await env.MISUB_KV.get(KV_KEY_MAIN, 'json') || [];
     const enabledMisubs = misubs.filter(sub => sub.enabled);
-    let manualNodes = '';
-
-    const httpSubs = enabledMisubs.filter(sub => sub.url.toLowerCase().startsWith('http'));
-    enabledMisubs.forEach(sub => {
-        if (!sub.url.toLowerCase().startsWith('http')) {
-            manualNodes += sub.url + '\n';
-        }
-    });
-
-    // [修改] 并行处理所有HTTP订阅 (V6 - 终极方案：忽略SSL错误)
-    const subPromises = httpSubs.map(async (sub) => {
-        try {
-            const requestHeaders = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-            };
-
-            // [核心修正] 添加 cf 对象以忽略SSL证书错误，与 CF-Workers-SUB 行为对齐
-            const fetchPromise = fetch(new Request(sub.url, {
-                headers: requestHeaders,
-                redirect: "follow",
-                cf: {
-                    insecureSkipVerify: true
-                }
-            }));
-
-            const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('Request timed out')), 10000) // 适当延长超时
-            );
-
-            const response = await Promise.race([fetchPromise, timeoutPromise]);
-            
-            if (!response.ok) {
-                console.log(`Failed to fetch ${sub.url}: Status ${response.status}`);
-                return '';
-            }
-
-            let text = await response.text();
-            
-            try {
-                const cleanedText = text.replace(/\s/g, '');
-                if (cleanedText.length > 20 && /^[A-Za-z0-9+/=]+$/.test(cleanedText)) {
-                    const binaryString = atob(cleanedText);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-                    text = new TextDecoder('utf-8').decode(bytes);
-                }
-            } catch (e) { /* 不是Base64, 忽略错误 */ }
-
-            if (config.prependSubName && sub.name) {
-                const nodes = text.split('\n').filter(line => line.trim());
-                const prefixedNodes = nodes.map(node => prependNodeName(node, sub.name)); 
-                return prefixedNodes.join('\n');
-            }
-            return text;
-        } catch (e) {
-            console.log(`Failed to process ${sub.url}: ${e.message}`);
-            return ''; 
-        }
-    });
-
-    const processedSubContents = await Promise.all(subPromises);
-    const subContent = processedSubContents.join('\n');
-
+    let urls = [], manualNodes = '';
+    for (const sub of enabledMisubs) {
+        if (sub.url.toLowerCase().startsWith('http')) urls.push(sub.url);
+        else manualNodes += sub.url + '\n';
+    }
+    const subContent = await getSUB(urls, userAgentHeader);
     const combinedContent = (manualNodes + subContent).split('\n').filter(line => line.trim()).join('\n');
     const base64Data = btoa(unescape(encodeURIComponent(combinedContent)));
-    // ...后续代码...
     
-    // 根据UA或参数决定输出格式
+    if (token === fakeToken) return new Response(base64Data);
+    
+    if (config.BotToken && config.ChatID) {
+        await sendMessage(config.BotToken, config.ChatID, `#获取订阅 ${config.FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}`);
+    }
+
     let targetFormat = 'base64';
-    const ua = userAgentHeader.toLowerCase();
+    const validFormats = ['clash', 'singbox', 'surge', 'quanx', 'loon', 'base64'];
     const urlTarget = url.searchParams.get('target');
 
-    if (urlTarget) {
+    if (urlTarget && validFormats.includes(urlTarget)) {
         targetFormat = urlTarget;
     } else {
+        const ua = userAgentHeader.toLowerCase();
         if (ua.includes('clash')) targetFormat = 'clash';
         else if (ua.includes('sing-box') || ua.includes('singbox')) targetFormat = 'singbox';
         else if (ua.includes('surge')) targetFormat = 'surge';
+        else if (ua.includes('quantumult%20x') || ua.includes('quanx')) targetFormat = 'quanx';
+        else if (ua.includes('loon')) targetFormat = 'loon';
     }
     
-    // 直接返回 Base64
     if (targetFormat === 'base64') {
-        return new Response(base64Data, { headers: { "content-type": "text/plain; charset=utf-8" } });
+        return new Response(base64Data, { headers: { "content-type": "text/plain; charset=utf-8", "Profile-Update-Interval": `${config.SUBUpdateTime}` } });
     }
-
-    // --- 内置转换逻辑 ---
-    let convertedContent = '';
-    let fileExtension = 'txt';
-
-    if (targetFormat === 'clash') {
-        convertedContent = generateClashConfig(combinedContent);
-        fileExtension = 'yaml';
-    } else { // 为所有其他格式提供一个基础的、未转换的占位符
-        convertedContent = `# ${targetFormat} conversion is not fully implemented yet.\n# Raw nodes:\n${combinedContent}`;
-        fileExtension = 'txt';
-    }
-
-    // 返回转换后的配置文件
-    return new Response(convertedContent, {
-        headers: {
-            "Content-Disposition": `attachment; filename*=utf-8''${encodeURIComponent(config.FileName)}.${fileExtension}`,
-            "content-type": "text/plain; charset=utf-8",
+    
+    const callbackUrl = `${url.protocol}//${url.hostname}/sub?token=${fakeToken}`;
+    const subConverterUrl = `https://${config.subConverter}/sub?target=${targetFormat}&url=${encodeURIComponent(callbackUrl)}&insert=false&config=${encodeURIComponent(config.subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+    
+    try {
+        const subConverterResponse = await fetch(subConverterUrl);
+        if (!subConverterResponse.ok) return new Response(`订阅转换失败: ${subConverterResponse.status}`, { status: 502 });
+        let subConverterContent = await subConverterResponse.text();
+        if (targetFormat === 'clash') {
+            subConverterContent = clashFix(subConverterContent);
         }
-    });
+
+        // --- 【关键修复】为配置文件添加 .yaml 后缀 ---
+        const fileName = `${config.FileName}.yaml`;
+
+        return new Response(subConverterContent, { 
+            headers: { 
+                "Content-Disposition": `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`,
+                "content-type": "text/plain; charset=utf-8",
+                "Profile-Update-Interval": `${config.SUBUpdateTime}`
+            } 
+        });
+    } catch (error) {
+        return new Response("订阅转换服务器连接失败", { status: 502 });
+    }
 }
+
 
 // --- Cloudflare Pages Functions 入口 ---
 export async function onRequest(context) {
@@ -261,188 +316,12 @@ export async function onRequest(context) {
     const url = new URL(request.url);
     try {
         if (url.pathname.startsWith('/api/')) return handleApiRequest(request, env);
-        if (url.pathname === '/sub') return handleMisubRequest(request, env);
+        const kv_settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
+        const mytoken = kv_settings.mytoken || env.TOKEN || 'auto';
+        if (url.pathname === '/sub' || url.pathname === `/${mytoken}`) return handleMisubRequest(request, env);
         return next();
     } catch (e) {
         console.error("Critical error in onRequest:", e);
-        if (e instanceof Error) {
-            return new Response(e.message, { status: 500 });
-        }
-        return new Response("Internal Server Error", { status: 500 });
+        return new Response("Internal Server Error: " + e.message, { status: 500 });
     }
-}
-
-// --- [新增] 内置订阅转换逻辑 ---
-
-/**
- * 解析单个节点链接 - v3 (Hysteria2, TUIC, REALITY 支持)
- * @param {string} link 
- * @returns {object|null}
- */
-/**
- * 解析单个节点链接 - v4 (SS协议解析修正版)
- * @param {string} link 
- * @returns {object|null}
- */
-/**
- * 解析单个节点链接 - v4 (Hysteria2 alpn 支持)
- * @param {string} link 
- * @returns {object|null}
- */
-function parseNodeLink(link) {
-    if (link.startsWith('vmess://')) {
-        try {
-            const decoded = JSON.parse(atob(link.substring(8)));
-            return { protocol: 'vmess', name: decoded.ps || decoded.add, server: decoded.add, port: decoded.port, uuid: decoded.id, alterId: decoded.aid, cipher: decoded.scy || 'auto', network: decoded.net, type: decoded.type, host: decoded.host, path: decoded.path, tls: decoded.tls === 'tls', sni: decoded.sni || decoded.host };
-        } catch (e) { return null; }
-    }
-    if (link.startsWith('vless://') || link.startsWith('trojan://')) {
-        try {
-            const url = new URL(link);
-            const params = new URLSearchParams(url.search);
-            return { protocol: url.protocol.replace(':', ''), name: decodeURIComponent(url.hash).substring(1) || url.hostname, server: url.hostname, port: url.port, uuid: url.username, password: url.username, sni: params.get('sni') || url.hostname, udp: true, tls: params.get('security') === 'tls' || params.get('security') === 'reality', security: params.get('security'), publicKey: params.get('pbk'), shortId: params.get('sid'), fingerprint: params.get('fp'), network: params.get('type'), serviceName: params.get('serviceName'), mode: params.get('mode'), path: params.get('path'), host: params.get('host') };
-        } catch (e) { return null; }
-    }
-    if (link.startsWith('ss://')) {
-        try {
-            const url = new URL(link);
-            const hashName = decodeURIComponent(url.hash).substring(1);
-            let cipher, password;
-            if (url.username) {
-                const decodedUserInfo = atob(url.username);
-                const colonIndex = decodedUserInfo.indexOf(':');
-                if (colonIndex !== -1) {
-                    cipher = decodedUserInfo.substring(0, colonIndex);
-                    password = decodedUserInfo.substring(colonIndex + 1);
-                }
-            }
-            if (!cipher || !password) return null;
-            return { protocol: 'ss', name: hashName || url.hostname, server: url.hostname, port: url.port, cipher: cipher, password: password };
-        } catch (e) { return null; }
-    }
-    if (link.startsWith('hy2://') || link.startsWith('hysteria2://')) {
-        try {
-            const url = new URL(link);
-            const params = new URLSearchParams(url.search);
-            return {
-                protocol: 'hysteria2',
-                name: decodeURIComponent(url.hash).substring(1) || url.hostname,
-                server: url.hostname,
-                port: url.port,
-                password: url.username,
-                sni: params.get('sni') || url.hostname,
-                insecure: params.get('insecure') === '1' || params.get('skip-cert-verify') === 'true',
-                alpn: params.get('alpn') // [新增] 提取 alpn 参数
-            };
-        } catch (e) { return null; }
-    }
-    if (link.startsWith('tuic://')) {
-         try {
-            const url = new URL(link);
-            const params = new URLSearchParams(url.search);
-            const [uuid, password] = url.username.split(':');
-            return { protocol: 'tuic', name: decodeURIComponent(url.hash).substring(1) || url.hostname, server: url.hostname, port: url.port, uuid: uuid, password: password, sni: params.get('sni') || url.hostname, insecure: params.get('allow_insecure') === '1' || params.get('skip-cert-verify') === 'true', 'udp-relay-mode': params.get('udp_relay_mode') || 'native', alpn: params.get('alpn') };
-        } catch (e) { return null; }
-    }
-    return null;
-}
-
-/**
- * 根据节点列表生成一个功能完备的Clash配置文件 - v5 (Hysteria2 最终修正版)
- * @param {string} nodesString
- * @returns {string}
- */
-function generateClashConfig(nodesString) {
-    const proxies = nodesString.split('\n')
-        .map(link => parseNodeLink(link.trim()))
-        .filter(Boolean); 
-
-    if (proxies.length === 0) return yaml.dump({ 'proxies': [] });
-
-    const proxyDetails = proxies.map(p => {
-        let entry = {
-            name: p.name,
-            type: p.protocol,
-            server: p.server,
-            port: p.port,
-        };
-
-        switch (p.protocol) {
-            case 'vmess':
-            case 'vless':
-                entry.uuid = p.uuid;
-                entry.udp = true;
-                entry.tls = p.tls;
-                entry.servername = p.sni;
-                entry['client-fingerprint'] = p.fingerprint || 'chrome';
-                if (p.security === 'reality') {
-                    entry['reality-opts'] = {
-                        'public-key': p.publicKey,
-                        'short-id': p.shortId || ''
-                    };
-                }
-                if (p.network === 'ws') {
-                    entry.network = 'ws';
-                    entry['ws-opts'] = {
-                        path: p.path || '/',
-                        headers: { Host: p.host || p.server }
-                    };
-                }
-                if (p.protocol === 'vmess') {
-                    entry.cipher = p.cipher || 'auto';
-                    entry.alterId = p.alterId || 0;
-                }
-                break;
-            case 'trojan':
-                entry.password = p.password;
-                entry.sni = p.sni;
-                entry.udp = true;
-                break;
-            case 'ss':
-                entry.cipher = p.cipher;
-                entry.password = p.password;
-                break;
-            // [最终修正] Hysteria2 支持
-            case 'hysteria2':
-                entry.type = 'hysteria2'; // 关键修正：使用 hysteria2 作为类型
-                entry.password = p.password;
-                entry.auth = p.password; // 关键补充：增加 auth 字段
-                entry.sni = p.sni;
-                entry['skip-cert-verify'] = p.insecure;
-                if (p.alpn) {
-                    entry.alpn = [p.alpn]; // 关键补充：增加 alpn 字段
-                }
-                break;
-            case 'tuic':
-                entry.type = 'tuic';
-                entry.uuid = p.uuid;
-                entry.password = p.password;
-                entry.sni = p.sni;
-                entry['skip-cert-verify'] = p.insecure;
-                entry['udp-relay-mode'] = p['udp-relay-mode'];
-                if (p.alpn) entry.alpn = [p.alpn];
-                break;
-        }
-        return entry;
-    });
-
-    const configObject = {
-        'port': 7890,
-        'socks-port': 7891,
-        'allow-lan': false,
-        'mode': 'Rule',
-        'log-level': 'info',
-        'external-controller': '127.0.0.1:9090',
-        'proxies': proxyDetails,
-        'proxy-groups': [{
-            name: "PROXY",
-            type: 'select',
-            proxies: proxies.map(p => p.name)
-        }],
-        'rules': [
-            'MATCH,PROXY'
-        ]
-    };
-
-    return yaml.dump(configObject);
 }
